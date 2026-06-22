@@ -4,8 +4,8 @@
 
   보드:
   - ESP32-C3 SuperMini
-  - 왼쪽 서보 신호  : GPIO0
-  - 오른쪽 서보 신호: GPIO1
+  - 왼쪽 서보 신호  : GPIO21
+  - 오른쪽 서보 신호: GPIO0
   - 서보 전원은 별도 외부 전원을 사용
   - ESP32 GND와 서보 전원 GND는 공통 연결
 
@@ -21,8 +21,8 @@
   - 조종 모드:
       Button 1 + Button 4 : DISARM / 대기 모드
 
-      UP          : 상승 / 스로틀 증가
-      DOWN        : 하강 / 스로틀 감소
+      UP          : 상승
+      DOWN        : 하강
       LEFT        : 좌회전
       RIGHT       : 우회전
       Button 1    : 왼쪽 방향 트림
@@ -30,8 +30,8 @@
       Button 3    : 상승 방향 트림
       Button 4    : 하강 방향 트림
 
-      Button 1 + Button 2 : 기본 스로틀 증가
-      Button 3 + Button 4 : 기본 스로틀 감소
+      Button 1 + Button 2 : 기본 주파수 증가
+      Button 3 + Button 4 : 기본 주파수 감소
       Button 1 + Button 3 : 기본 진폭 감소
       Button 2 + Button 4 : 기본 진폭 증가
       Button 1 + Button 3 : 기본 진폭 감소 110us씩
@@ -116,8 +116,8 @@ const int MAX_STEER_US = 160;
 const int MAX_ELEV_US  = 160;
 
 // 트림 값입니다.
-int trimSteerUs = 0;
-int trimElevUs  = 0;
+int trimSteerUs = 24;
+int trimElevUs  = -24;
 
 const int TRIM_STEP_US  = 12;
 const int TRIM_LIMIT_US = 160;
@@ -135,20 +135,16 @@ int lastLeftUs  = SERVO_CENTER_US;
 int lastRightUs = SERVO_CENTER_US;
 
 // =====================================================
-// 스로틀 설정
-// 기체가 충분히 날갯짓하지 않으면 먼저 이 값들을 조정합니다.
+// 날갯짓 주파수 설정
+// Hz는 날개가 +진폭과 -진폭을 한 번 왕복하는 주기 기준입니다.
 // =====================================================
 
-const int BASE_THROTTLE_DEFAULT = 60;
+const float BASE_FLAP_FREQUENCY_HZ = 2.0;
+const float FLAP_FREQUENCY_MIN_HZ  = 1.0;
+const float FLAP_FREQUENCY_MAX_HZ  = 3.9;
+const float FLAP_FREQUENCY_STEP_HZ = 0.1;
 
-const int THROTTLE_MIN = 1;
-const int THROTTLE_MAX = 100;
-
-const int THROTTLE_UP_BOOST   = 20;
-const int THROTTLE_DOWN_DROP  = 20;
-const int THROTTLE_STEP       = 10;
-
-int baseThrottleLevel = BASE_THROTTLE_DEFAULT;
+float baseFlapFrequencyHz = BASE_FLAP_FREQUENCY_HZ;
 
 // =====================================================
 // 버튼 상태
@@ -176,15 +172,16 @@ bool prevCombo14 = false;
 
 bool armed = false;
 
-float phase = 0.0;
 float currentOffsetUs = 0.0;
+int flapSign = 1;
 
 unsigned long lastBlinkMs       = 0;
 unsigned long lastTrimMs        = 0;
 unsigned long lastLogMs         = 0;
-unsigned long lastThrottleAdjMs = 0;
+unsigned long lastFrequencyAdjMs = 0;
 unsigned long lastAmplitudeAdjMs = 0;
 unsigned long lastNeutralMs     = 0;
+unsigned long lastFlapSwitchMs  = 0;
 
 bool blinkState = false;
 
@@ -206,9 +203,9 @@ void updateTrimButtons(bool combo12, bool combo34, bool combo14, bool combo13, b
 void loadTrimSettings();
 void scheduleTrimSave();
 void updateTrimSave();
-void updateThrottleAdjust(bool combo12, bool combo34);
+void updateFrequencyAdjust(bool combo12, bool combo34);
 void updateAmplitudeAdjust(bool combo13, bool combo24);
-void updateFlapping(int throttleLevel);
+void updateFlapping();
 
 void writeServosUs(int leftUs, int rightUs);
 void writeServosUs(int leftUs, int rightUs, bool force);
@@ -220,11 +217,10 @@ void ledOff();
 void blinkLed(unsigned long intervalMs);
 
 void sendToApp(const String& msg);
-void logStatus(int throttleLevel, int steerUs, int elevUs, int targetLeftUs, int targetRightUs);
+void logStatus(int steerUs, int elevUs, int targetLeftUs, int targetRightUs);
 void savePreviousStates();
 
 bool risingEdge(bool current, bool previous);
-float approach(float current, float target, float step);
 
 // =====================================================
 // BLE 콜백
@@ -286,8 +282,9 @@ void setup() {
   Serial.println("Connect with Bluefruit Connect");
   Serial.println("Controller -> Control Pad");
   Serial.println("Press Button 1 + Button 4 to toggle ARM / STANDBY");
-  Serial.print("Base throttle = ");
-  Serial.println(baseThrottleLevel);
+  Serial.print("Base frequency = ");
+  Serial.print(baseFlapFrequencyHz, 1);
+  Serial.println("Hz");
   Serial.print("Base amplitude = ");
   Serial.print(baseFlapAmplitudeUs);
   Serial.println("us");
@@ -365,6 +362,8 @@ void handleBleConnection() {
   if (!deviceConnected && oldDeviceConnected) {
     armed = false;
     currentOffsetUs = 0;
+    flapSign = 1;
+    lastFlapSwitchMs = millis();
 
     forceNeutralServos();
 
@@ -404,8 +403,9 @@ void standbyMode() {
   if (risingEdge(combo14, prevCombo14)) {
     armed = true;
 
-    phase = PI;
     currentOffsetUs = 0;
+    flapSign = 1;
+    lastFlapSwitchMs = millis();
 
     forceNeutralServos();
     ledOn();
@@ -443,8 +443,8 @@ void armedMode() {
     return;
   }
 
-  // 조종 모드에서 버튼 조합으로 기본 스로틀을 조정합니다.
-  updateThrottleAdjust(combo12, combo34);
+  // 조종 모드에서 버튼 조합으로 기본 날갯짓 주파수를 조정합니다.
+  updateFrequencyAdjust(combo12, combo34);
 
   // 조종 모드에서 버튼 조합으로 기본 진폭을 조정합니다.
   updateAmplitudeAdjust(combo13, combo24);
@@ -454,7 +454,6 @@ void armedMode() {
 
   int steerUs = 0;
   int elevUs = 0;
-  int throttleLevel = baseThrottleLevel;
 
   // 좌우 방향 버튼은 조향 입력입니다.
   if (btnLeft && !btnRight) {
@@ -463,21 +462,16 @@ void armedMode() {
     steerUs = MAX_STEER_US;
   }
 
-  // 상하 방향 버튼은 상승/하강 입력과 임시 스로틀 보정을 함께 적용합니다.
+  // 상하 방향 버튼은 상승/하강 입력입니다.
   if (btnUp && !btnDown) {
-    throttleLevel = baseThrottleLevel + THROTTLE_UP_BOOST;
     elevUs = MAX_ELEV_US;
   } else if (btnDown && !btnUp) {
-    throttleLevel = baseThrottleLevel - THROTTLE_DOWN_DROP;
     elevUs = -MAX_ELEV_US;
   } else {
-    throttleLevel = baseThrottleLevel;
     elevUs = 0;
   }
 
-  throttleLevel = constrain(throttleLevel, THROTTLE_MIN, THROTTLE_MAX);
-
-  updateFlapping(throttleLevel);
+  updateFlapping();
 
   /*
     서보 믹싱:
@@ -498,9 +492,9 @@ void armedMode() {
   int leftUs  = SERVO_CENTER_US + (int)currentOffsetUs + finalSteer + finalElev;
   int rightUs = SERVO_CENTER_US - (int)currentOffsetUs + finalSteer - finalElev;
   
-  writeServosUs(leftUs, rightUs);
+  writeServosUs(leftUs, rightUs, true);
 
-  logStatus(throttleLevel, steerUs, elevUs, leftUs, rightUs);
+  logStatus(steerUs, elevUs, leftUs, rightUs);
 }
 
 // =====================================================
@@ -603,39 +597,40 @@ bool risingEdge(bool current, bool previous) {
 }
 
 // =====================================================
-// 스로틀 조정
+// 날갯짓 주파수 조정
 // =====================================================
 
-void updateThrottleAdjust(bool combo12, bool combo34) {
-  if (millis() - lastThrottleAdjMs < 180) {
+void updateFrequencyAdjust(bool combo12, bool combo34) {
+  if (millis() - lastFrequencyAdjMs < 180) {
     return;
   }
 
   bool changed = false;
 
-  // Button 1 + Button 2: 기본 스로틀 증가
+  // Button 1 + Button 2: 기본 주파수 증가
   if (combo12) {
-    baseThrottleLevel += THROTTLE_STEP;
+    baseFlapFrequencyHz += FLAP_FREQUENCY_STEP_HZ;
     changed = true;
   }
 
-  // Button 3 + Button 4: 기본 스로틀 감소
+  // Button 3 + Button 4: 기본 주파수 감소
   if (combo34) {
-    baseThrottleLevel -= THROTTLE_STEP;
+    baseFlapFrequencyHz -= FLAP_FREQUENCY_STEP_HZ;
     changed = true;
   }
 
-  baseThrottleLevel = constrain(baseThrottleLevel, THROTTLE_MIN, THROTTLE_MAX);
+  baseFlapFrequencyHz = constrain(baseFlapFrequencyHz, FLAP_FREQUENCY_MIN_HZ, FLAP_FREQUENCY_MAX_HZ);
 
   if (changed) {
-    lastThrottleAdjMs = millis();
+    lastFrequencyAdjMs = millis();
 
-    Serial.print("[BASE THROTTLE] ");
-    Serial.println(baseThrottleLevel);
+    Serial.print("[BASE FREQUENCY] ");
+    Serial.print(baseFlapFrequencyHz, 1);
+    Serial.println("Hz");
 
-    String msg = "[BASE THROTTLE] ";
-    msg += baseThrottleLevel;
-    msg += "\n";
+    String msg = "[BASE FREQUENCY] ";
+    msg += String(baseFlapFrequencyHz, 1);
+    msg += "Hz\n";
     sendToApp(msg);
   }
 }
@@ -795,22 +790,25 @@ void updateTrimSave() {
 // 날갯짓 계산
 // =====================================================
 
-void updateFlapping(int throttleLevel) {
-  if (throttleLevel <= 0) {
-    currentOffsetUs = approach(currentOffsetUs, 0, 18);
-    return;
+void updateFlapping() {
+  unsigned long now = millis();
+  unsigned long halfPeriodMs = (unsigned long)(500.0 / baseFlapFrequencyHz);
+
+  if (halfPeriodMs < 1) {
+    halfPeriodMs = 1;
   }
 
-  // throttleLevel이 높을수록 사인파 위상 진행 속도가 빨라집니다.
-  float speedFactor = map(throttleLevel, 0, 100, 20, 120) / 1000.0;
+  if (now - lastFlapSwitchMs >= halfPeriodMs) {
+    unsigned long steps = (now - lastFlapSwitchMs) / halfPeriodMs;
 
-  phase += speedFactor;
+    if ((steps % 2) == 1) {
+      flapSign = -flapSign;
+    }
 
-  if (phase >= TWO_PI) {
-    phase -= TWO_PI;
+    lastFlapSwitchMs += steps * halfPeriodMs;
   }
 
-  currentOffsetUs = sin(phase) * baseFlapAmplitudeUs;
+  currentOffsetUs = flapSign * baseFlapAmplitudeUs;
 }
 
 // =====================================================
@@ -890,22 +888,6 @@ void blinkLed(unsigned long intervalMs) {
 // 유틸리티
 // =====================================================
 
-float approach(float current, float target, float step) {
-  if (current < target) {
-    current += step;
-    if (current > target) {
-      current = target;
-    }
-  } else if (current > target) {
-    current -= step;
-    if (current < target) {
-      current = target;
-    }
-  }
-
-  return current;
-}
-
 void sendToApp(const String& msg) {
   if (deviceConnected && pTxCharacteristic != nullptr) {
     pTxCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
@@ -913,18 +895,15 @@ void sendToApp(const String& msg) {
   }
 }
 
-void logStatus(int throttleLevel, int steerUs, int elevUs, int targetLeftUs, int targetRightUs) {
+void logStatus(int steerUs, int elevUs, int targetLeftUs, int targetRightUs) {
   if (millis() - lastLogMs < 80) {
     return;
   }
 
   lastLogMs = millis();
 
-  Serial.print("[RUN] throttle=");
-  Serial.print(throttleLevel);
-
-  Serial.print(" baseThrottle=");
-  Serial.print(baseThrottleLevel);
+  Serial.print("[RUN] baseHz=");
+  Serial.print(baseFlapFrequencyHz, 1);
 
   Serial.print(" baseAmp=");
   Serial.print(baseFlapAmplitudeUs);
